@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -398,7 +399,39 @@ func (o *OVN) xbctl(southbound bool, extraArgs ...string) (string, error) {
 	}
 
 	args = append(args, extraArgs...)
-	return shared.RunCommandInheritFds(context.Background(), files, cmd, args...)
+
+	// Run outside daemon mode, the client gives each database remote one connection attempt of one second,
+	// accepts only the cluster leader, and gives up with "database connection failed" when no attempt
+	// succeeds. One slow connection to a busy leader is then enough to fail the command, and when every
+	// member of a large cluster runs one at the same moment (creating a network does this) some of them hit
+	// it. Nothing has been sent to the database at that point, so run the command again, after a wait that
+	// differs between members so they do not all return together.
+	for attempt := 1; ; attempt++ {
+		out, err := shared.RunCommandInheritFds(context.Background(), files, cmd, args...)
+		if err == nil || attempt >= xbctlConnectAttempts || !isOVNConnectFailure(err) {
+			return out, err
+		}
+
+		logger.Warn("Failed connecting to OVN database, retrying", logger.Ctx{"cmd": cmd, "attempt": attempt, "err": err})
+		time.Sleep(xbctlConnectRetryDelay/2 + rand.N(xbctlConnectRetryDelay))
+	}
+}
+
+// xbctlConnectAttempts is how many times xbctl runs a command that fails to connect to the database.
+const xbctlConnectAttempts = 5
+
+// xbctlConnectRetryDelay is the wait between those attempts: half of it, plus a random share of it.
+var xbctlConnectRetryDelay = 2 * time.Second
+
+// isOVNConnectFailure reports whether err is ovn-nbctl or ovn-sbctl failing to connect to its database, as
+// opposed to the database refusing or failing the command.
+func isOVNConnectFailure(err error) bool {
+	runErr, ok := errors.AsType[shared.RunError](err)
+	if !ok {
+		return false
+	}
+
+	return strings.Contains(runErr.StdErr().String(), "database connection failed")
 }
 
 // LogicalRouterAdd adds a named logical router.
